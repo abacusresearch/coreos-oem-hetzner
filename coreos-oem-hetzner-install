@@ -1,0 +1,147 @@
+#!/bin/bash
+# Copyright (c) 2013 The CoreOS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+set -e -o pipefail
+
+# Ensure that required executables exist before proceeding
+which wget >/dev/null || exit 1
+which gpg >/dev/null || exit 1
+
+# Everything we do should be user-access only!
+umask 077
+
+if grep -q "^ID=coreos$" /etc/os-release; then
+    source /etc/os-release
+    [[ -f /usr/share/coreos/update.conf ]] && source /usr/share/coreos/update.conf
+    [[ -f /etc/coreos/update.conf ]] && source /etc/coreos/update.conf
+fi
+
+# Fall back on the current beta if os-release isn't useful
+: ${VERSION_ID:=current}
+CHANNEL_ID=${GROUP:-beta}
+
+USAGE="Usage: $0 [-d /dev/device]
+Options:
+    -d DEVICE   Install CoreOS OEM to the given device.
+    -v          Super verbose, for debugging.
+    -h          This ;-)
+
+"
+
+DEVICE=""
+
+while getopts "V:C:d:o:c:t:b:vh" OPTION
+do
+    case $OPTION in
+        d) DEVICE="$OPTARG" ;;
+        v) set -x ;;
+        h) echo "$USAGE"; exit;;
+        *) exit 1;;
+    esac
+done
+
+# Device is required, must not be a partition, must be writable
+if [[ -z "${DEVICE}" ]]; then
+    echo "$0: No target block device provided, -d is required." >&2
+    exit 1
+fi
+
+if ! [[ $(lsblk -n -d -o TYPE "${DEVICE}") =~ ^(disk|loop|lvm)$ ]]; then
+    echo "$0: Target block device (${DEVICE}) is not a full disk." >&2
+    exit 1
+fi
+
+if [[ ! -w "${DEVICE}" ]]; then
+    echo "$0: Target block device (${DEVICE}) is not writable (are you root?)" >&2
+    exit 1
+fi
+
+# Pre-flight checks pass, lets get this party started!
+WORKDIR=$(mktemp --tmpdir -d coreos-install.XXXXXXXXXX)
+trap "rm -rf '${WORKDIR}'" EXIT
+
+# The OEM partition should be #9 but make no assumptions here!
+# Also don't mount by label directly in case other devices conflict.
+OEM_DEV=$(blkid -t "LABEL=OEM" -o device "${DEVICE}"*)
+
+if [[ -z "${OEM_DEV}" ]]; then
+    echo "Unable to find new OEM partition on ${DEVICE}" >&2
+    exit 1
+fi
+
+echo "Installing cloud-config..."
+mkdir -p "${WORKDIR}/oemfs"
+case $(blkid -t "LABEL=OEM" -o value -s TYPE "${OEM_DEV}") in
+    "btrfs") mount -t btrfs -o subvol=root "${OEM_DEV}" "${WORKDIR}/oemfs" ;;
+    *)       mount "${OEM_DEV}" "${WORKDIR}/oemfs" ;;
+esac
+trap "umount '${WORKDIR}/oemfs' && rm -rf '${WORKDIR}'" EXIT
+
+cat > ${WORKDIR}/oemfs/cloud-config.yml <<EOT
+#cloud-config
+
+coreos:
+    oem:
+      id: hetzner
+      name: Hetzner Barebone Servers
+      version-id: 0.0.1
+      home-url: http://www.hetzner.de
+      bug-report-url: https://github.com/coreos/coreos-overlay
+write_files:
+    - path: /run/systemd/system/etcd.service.d/10-oem.conf
+      permissions: 0644
+      content: |
+        [Service]
+        Environment=ETCD_PEER_ELECTION_TIMEOUT=1200
+EOT
+
+cat > ${WORKDIR}/oemfs/coreos-setup-environment <<EOT
+#!/bin/bash -e
+
+ENV=\$1
+
+if [ -z "\$ENV" ]; then
+        echo usage: \$0 /etc/environment
+        exit 1
+fi
+# test for rw
+touch \$ENV
+if [ \$? -ne 0 ]; then
+        echo exiting, unable to modify: \$ENV
+        exit 1
+fi
+
+sed -i -e '/^COREOS_PUBLIC_IPV4=/d' \
+    -e '/^COREOS_PRIVATE_IPV4=/d' \
+    "\${ENV}"
+
+# We spin loop until the nova-agent sets up the ip addresses
+function get_ip () {
+	IF=\$1
+	IP=
+	while [ 1 ]; do
+		IP=\$(ifconfig \$IF | awk '/inet /{print \$2}')
+		if [ "\$IP" != "" ]; then
+			break
+		fi
+		sleep .1
+	done
+	echo \$IP	
+}
+
+DEV=\$(ip r s|grep '^default' |awk '{print \$5}')
+
+echo COREOS_PUBLIC_IPV4=\$(get_ip \$DEV) >> \$ENV
+echo COREOS_PRIVATE_IPV4=\$(get_ip \$DEV) >> \$ENV
+EOT
+
+chmod 755 ${WORKDIR}/oemfs/coreos-setup-environment
+
+umount "${WORKDIR}/oemfs"
+
+rm -rf "${WORKDIR}"
+trap - EXIT
+
+echo "Success! CoreOS OEM is installed on ${DEVICE}"
